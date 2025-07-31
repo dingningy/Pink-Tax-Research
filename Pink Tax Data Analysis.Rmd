@@ -1,0 +1,2002 @@
+---
+title: "Pink Tax Data Analysis"
+author: "Dingning Yang"
+date: "2025-07-23"
+format: 
+ html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Table of Contents"
+    number-sections: true
+    highlight-style: github
+    theme: cosmo
+    fontsize: 1.25em
+    linestretch: 1.5
+---
+
+```{r}
+#| label: setup
+#| include: false
+# Install required packages
+if(!require(tidyverse)){install.packages("tidyverse")}
+if(!require(ggplot2)){install.packages("ggplot2")}
+if(!require(readr)){install.packages("readr")}
+if(!require(knitr)){install.packages("knitr")}
+if(!require(broom)){install.packages("broom")}
+if(!require(psych)){install.packages("psych")}
+if(!require(lmtest)){install.packages("lmtest")}
+if(!require(ggpubr)){install.packages("ggpubr")}
+if(!require(kableExtra)){install.packages("kableExtra")}
+if(!require(effsize)){install.packages("effsize")}
+
+
+if (!requireNamespace("nnet", quietly = TRUE)) {
+  install.packages("nnet")
+}
+library(nnet)
+# List of packages
+required_packages <- c("tidyverse", "ggplot2", "readr", "knitr", "broom", "psych", "lmtest", "ggpubr", "kableExtra","effsize")
+
+# Load packages
+lapply(required_packages, library, character.only = TRUE)
+set.seed(123)
+
+
+```
+
+```{r}
+#| label: Read Data
+#| include: false
+
+# You have to edit the path here to render output without error
+raw.pink <- read_csv("C:/Users/yDn/Desktop/2025 Summer/Research/WO-Pink Tax/Study 1/Data Analysis/pink.tax.raw.csv")
+
+
+```
+
+```{r}
+#| label: Data Cleaning
+#| include: false
+
+# Remove unnecessary rows
+raw.pink <- raw.pink %>% slice(-c(1, 2,3))
+
+
+# Find IPs that appear more than once
+duplicate_ips <- raw.pink %>%
+  group_by(IPAddress) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  filter(count > 1) %>%
+  arrange(desc(count))
+
+print(duplicate_ips)
+
+# Remove duplicate IPs, keeping only the first occurrence: N = 1001 after this
+raw.pink <- raw.pink %>%
+  arrange(IPAddress, StartDate) %>%  # Sort by IP and then by StartDate
+  group_by(IPAddress) %>%            # Group by IP address
+  slice(1) %>%                       # Keep only the first row in each group
+  ungroup()                          # Remove grouping
+
+# Attention checks: N = 998 after this (99.7%)
+raw.pink <- raw.pink %>%
+  filter(attention_check == 2)
+
+
+# Check completeness: All completed the survey:) --> N = 998
+table(raw.pink$Finished)
+table(raw.pink$Progress) 
+
+# Remove unnecessary columns
+raw.pink <- raw.pink %>% select(-c(1:17, 41:43))
+
+# Check consent: All consent
+table(raw.pink$consent_yn)
+raw.pink <- raw.pink %>% select(-c(1:2))
+
+# Manipulation checks - Price Difference: N = 969 after this (Success rate: 96.8%)
+# Check the relationship between MainCondition and mc_price
+manipulation_check <- raw.pink %>%
+  count(MainCondition, mc_price) %>%
+  arrange(MainCondition, mc_price)
+
+print("Cross-tabulation of MainCondition and mc_price:")
+print(manipulation_check)
+
+# More detailed view
+table(raw.pink$MainCondition, raw.pink$mc_price, useNA = "ifany")
+
+# Create a flag for correct manipulation check responses
+manipulation_analysis <- raw.pink %>%
+  mutate(
+    manipulation_correct = case_when(
+      MainCondition == 1 & mc_price == 3 ~ TRUE,   # Condition 1 should have mc_price = 3
+      MainCondition != 1 & mc_price == 1 ~ TRUE,   # Other conditions should have mc_price = 1
+      TRUE ~ FALSE                                   # All other combinations are incorrect
+    )
+  )
+
+# Summary of manipulation check results
+manipulation_summary <- manipulation_analysis %>%
+  summarise(
+    total_responses = n(),
+    correct_responses = sum(manipulation_correct, na.rm = TRUE),
+    incorrect_responses = sum(!manipulation_correct, na.rm = TRUE),
+    missing_data = sum(is.na(MainCondition) | is.na(mc_price)),
+    success_rate = round(mean(manipulation_correct, na.rm = TRUE) * 100, 2)
+  )
+
+print("Manipulation Check Summary:")
+print(manipulation_summary)
+
+cleaned.pink <- raw.pink %>%
+  filter(
+    (MainCondition == 1 & mc_price == 3) |  # Condition 1 with correct response
+    (MainCondition != 1 & mc_price == 1)    # Other conditions with correct response
+  )
+
+print(paste("Original dataset:", nrow(raw.pink), "rows"))
+print(paste("After manipulation check filter:", nrow(cleaned.pink), "rows"))
+print(paste("Removed:", nrow(raw.pink) - nrow(cleaned.pink), "rows"))
+
+# Simple count by condition
+condition_counts <- cleaned.pink %>%
+  count(MainCondition, name = "n_participants") %>%
+  arrange(MainCondition)
+
+print("Number of participants in each condition:")
+print(condition_counts)
+
+# Control: N = 208, Pink Tax: N = 217, PT-Design: N = 109, PT-Color: N = 109, PT-Ingredient: N = 110, PT-Fragrance: N = 110, PT-Ad: N = 106 --> Meet our setting for initial targets!
+
+#===============================================
+
+# Rename, reorder, compose variables
+
+cleaned.pink <- cleaned.pink %>%
+  mutate(
+    # Convert to numeric first
+    across(price_fairness_5:price_fairness_8, as.numeric),
+    # Then reverse code
+    across(price_fairness_5:price_fairness_8, ~ 8 - .)
+  )
+
+
+cleaned.pink <- cleaned.pink %>%
+  rename(condition = MainCondition) %>%
+  relocate(condition, .before = everything()) %>%
+  mutate(condition = factor(condition, levels = c("1", "2", "3A", "3B", "3C", "3D", "3E"))) %>%
+  arrange(condition)
+
+
+cleaned.pink <- cleaned.pink %>%
+  rename(product_choice = bi_binary)
+
+cleaned.pink <- cleaned.pink %>%
+  mutate(
+    bi_women_1 = as.numeric(bi_women_1),
+    bi_men_1 = as.numeric(bi_men_1),
+    bi_women = bi_women_1 - bi_men_1
+  ) %>%
+  relocate(bi_women, .after = product_choice)
+
+
+cleaned.pink <- cleaned.pink %>% select(-c(4:5))
+
+cleaned.pink <- cleaned.pink %>%
+  # First convert all price_fairness columns to numeric
+  mutate(
+    across(price_fairness_1:price_fairness_8, as.numeric)
+  ) %>%
+  # Then create the composite score
+  rowwise() %>%
+  mutate(
+    price_fairness = mean(c_across(price_fairness_1:price_fairness_8), na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  relocate(price_fairness, .before = price_fairness_1)
+
+
+cleaned.pink <- cleaned.pink %>% select(-c(5:12))
+
+cleaned.pink <- cleaned.pink %>%
+  rename(similarity = similarity_1)
+
+cleaned.pink <- cleaned.pink %>% select(-c(6))
+
+
+cleaned.pink <- cleaned.pink %>%
+  relocate(mc_justification, .after = everything())
+
+cleaned.pink <- cleaned.pink %>%
+  relocate(feedback, .after = everything())
+
+cleaned.pink <- cleaned.pink %>%
+  mutate(
+    cost_women = coalesce(ce_control_women, ce_pt_women)
+  ) %>%
+  relocate(cost_women, .after = similarity)
+
+cleaned.pink <- cleaned.pink %>%
+  mutate(
+    cost_men = coalesce(ce_control_men, ce_pt_men)
+  ) %>%
+  relocate(cost_men, .after = cost_women)
+
+
+cleaned.pink <- cleaned.pink %>% select(-c(8:11))
+
+cleaned.pink <- cleaned.pink %>%
+  mutate(
+    product_choice = factor(product_choice, 
+                           levels = c(1, 2, 3))
+  )
+
+cleaned.pink <- cleaned.pink %>%
+  mutate(
+    similarity = as.numeric(similarity),
+    cost_women = as.numeric(cost_women),
+    cost_men = as.numeric(cost_men),
+    income = as.numeric(income),
+    age = as.numeric(age)
+  )
+
+write.csv(cleaned.pink, "cleaned_pink_dataset.csv", row.names = FALSE)
+
+```
+
+
+# Descriptive
+
+```{r}
+#| label: Descriptive
+
+# Mean and SD of age
+mean_age <- mean(cleaned.pink$age, na.rm = TRUE)
+sd_age <- sd(cleaned.pink$age, na.rm = TRUE)
+
+print(paste("Mean age:", round(mean_age, 2)))
+print(paste("SD age:", round(sd_age, 2)))
+
+# Mean = 44.8 years old, SD = 13.93, all female participants
+
+
+
+```
+
+
+# Main Effect
+
+## Logistic Regression - Conditions' Impacts on Product Choice
+
+### Control vs. Pink Tax
+```{r}
+#| label: Control vs. pink tax on product choice
+#| include: false
+
+
+control_pt <- cleaned.pink %>%
+  filter(condition %in% c("1", "2")) %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Make sure condition is factor with condition 1 as reference
+    condition = factor(condition, levels = c("1", "2"))
+  )
+
+# Check the coding
+table(control_pt$condition, control_pt$chose_women_shampoo)
+
+# Run the logistic regression
+control_pt_logistic <- glm(chose_women_shampoo ~ condition, 
+             data = control_pt, 
+             family = binomial)
+
+# View results
+summary(control_pt_logistic)
+exp(coef(control_pt_logistic))
+exp(confint(control_pt_logistic))
+
+# 79.8% of participants in the control condition chose women's shampoo. Participants in the pink tax condition are 79% less likely to choose women's shampoo compared to control (1 - 0.21 = 0.79). 
+
+
+```
+
+A logistic regression was conducted to examine the effect of pink tax information on product choice, specifically comparing the control condition (condition 1) and pink tax condition (condition 2) on participants' likelihood of choosing women's shampoo versus other options.
+
+The analysis revealed a significant effect of condition on product choice (β = -1.57, SE = 0.22, z = -7.13, p < .001). In the control condition, 79.8% of participants chose women's shampoo. However, exposure to pink tax information significantly reduced this preference, with participants in the pink tax condition being 79% less likely to choose women's shampoo compared to those in the control condition (OR = 0.21, 95% CI [0.13, 0.32]).
+
+
+
+```{r}
+#| label: Control vs. pink tax on product choice plot
+#| echo: false
+
+
+# Create choice labels
+choice_data <- control_pt %>%
+  mutate(
+    choice_label = case_when(
+      product_choice == 1 ~ "Women's Shampoo",
+      product_choice == 2 ~ "Men's Shampoo", 
+      product_choice == 3 ~ "None"
+    ),
+    condition_label = case_when(
+      condition == "1" ~ "Control",
+      condition == "2" ~ "Pink Tax"
+    )
+  ) %>%
+  count(condition_label, choice_label) %>%
+  group_by(condition_label) %>%
+  mutate(
+    total = sum(n),
+    proportion = n / total
+  )
+
+ggplot(choice_data, aes(x = condition_label, y = proportion, fill = choice_label)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = paste0(round(proportion*100, 1), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("Women's Shampoo" = "#e91e63", 
+                              "Men's Shampoo" = "#2196f3", 
+                              "None" = "#9e9e9e")) +
+  labs(
+    title = "Product Choice Distribution by Condition",
+    x = "Condition",
+    y = "Proportion",
+    fill = "Product Choice"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+
+
+
+
+```
+
+
+
+### Pink Tax vs. pink tax (design justifications)
+```{r}
+#| label: Pink tax vs. pink tax (design justifications)
+#| include: false
+pt_design <- cleaned.pink %>%
+  filter(condition %in% c("2", "3A")) %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Make sure condition is factor with condition 2 as reference
+    condition = factor(condition, levels = c("2", "3A"))
+  )
+
+# Check the coding
+table(pt_design$condition, pt_design$chose_women_shampoo)
+
+# Run the logistic regression
+pt_design_logistic <- glm(chose_women_shampoo ~ condition, 
+             data = pt_design, 
+             family = binomial)
+
+# View results
+summary(pt_design_logistic)
+exp(coef(pt_design_logistic))
+exp(confint(pt_design_logistic))
+```
+
+The analysis revealed no significant difference between the two conditions (β = -0.39, SE = 0.24, z = -1.62, p = .106). In the pink tax condition (reference group), 45.2% of participants chose women's shampoo. Participants in the design condition showed a numerically lower preference for women's shampoo, with 32.3% making this choice, but this difference was not statistically significant (OR = 0.68, 95% CI [0.42, 1.08]).But this reveals that providing justifications from the design perspective may even result in lower purchase intention.
+
+```{r}
+#| label: Pink tax vs. pink tax (design justification) on product choice plot
+#| echo: false
+
+
+# Create choice labels
+choice_data <- pt_design %>%
+  mutate(
+    choice_label = case_when(
+      product_choice == 1 ~ "Women's Shampoo",
+      product_choice == 2 ~ "Men's Shampoo", 
+      product_choice == 3 ~ "None"
+    ),
+    condition_label = case_when(
+      condition == "3A" ~ "Pink Tax (Design justification)",
+      condition == "2" ~ "Pink Tax"
+    )
+  ) %>%
+  count(condition_label, choice_label) %>%
+  group_by(condition_label) %>%
+  mutate(
+    total = sum(n),
+    proportion = n / total
+  )
+
+ggplot(choice_data, aes(x = condition_label, y = proportion, fill = choice_label)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = paste0(round(proportion*100, 1), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("Women's Shampoo" = "#e91e63", 
+                              "Men's Shampoo" = "#2196f3", 
+                              "None" = "#9e9e9e")) +
+  labs(
+    title = "Product Choice Distribution by Condition",
+    x = "Condition",
+    y = "Proportion",
+    fill = "Product Choice"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+
+
+
+
+```
+
+### Pink Tax vs. pink tax (color justifications)
+```{r}
+#| label: Pink tax vs. pink tax (color justifications)
+#| include: false
+pt_color <- cleaned.pink %>%
+  filter(condition %in% c("2", "3B")) %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Make sure condition is factor with condition 2 as reference
+    condition = factor(condition, levels = c("2", "3B"))
+  )
+
+# Check the coding
+table(pt_color$condition, pt_color$chose_women_shampoo)
+
+# Run the logistic regression
+pt_color_logistic <- glm(chose_women_shampoo ~ condition, 
+             data = pt_color, 
+             family = binomial)
+
+# View results
+summary(pt_color_logistic)
+exp(coef(pt_color_logistic))
+exp(confint(pt_color_logistic))
+```
+
+The analysis revealed no significant difference between the two conditions (β = -0.20, SE = 0.24, z = -0.82, p = .410). In the pink tax condition (reference group), 45.2% of participants chose women's shampoo. Participants in the color condition showed a very similar preference for women's shampoo at 40.4%, with this minimal difference not reaching statistical significance (OR = 0.82, 95% CI [0.51, 1.31]).
+
+
+```{r}
+#| label: Pink tax vs. pink tax (color justification) on product choice plot
+#| echo: false
+
+
+# Create choice labels
+choice_data <- pt_color %>%
+  mutate(
+    choice_label = case_when(
+      product_choice == 1 ~ "Women's Shampoo",
+      product_choice == 2 ~ "Men's Shampoo", 
+      product_choice == 3 ~ "None"
+    ),
+    condition_label = case_when(
+      condition == "3B" ~ "Pink Tax (color justification)",
+      condition == "2" ~ "Pink Tax"
+    )
+  ) %>%
+  count(condition_label, choice_label) %>%
+  group_by(condition_label) %>%
+  mutate(
+    total = sum(n),
+    proportion = n / total
+  )
+
+ggplot(choice_data, aes(x = condition_label, y = proportion, fill = choice_label)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = paste0(round(proportion*100, 1), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("Women's Shampoo" = "#e91e63", 
+                              "Men's Shampoo" = "#2196f3", 
+                              "None" = "#9e9e9e")) +
+  labs(
+    title = "Product Choice Distribution by Condition",
+    x = "Condition",
+    y = "Proportion",
+    fill = "Product Choice"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+
+
+
+
+```
+
+### Pink Tax vs. pink tax (ingredient justifications)
+```{r}
+#| label: Pink tax vs. pink tax (ingredient justifications)
+#| include: false
+pt_ingredient <- cleaned.pink %>%
+  filter(condition %in% c("2", "3C")) %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Make sure condition is factor with condition 2 as reference
+    condition = factor(condition, levels = c("2", "3C"))
+  )
+
+# Check the coding
+table(pt_ingredient$condition, pt_ingredient$chose_women_shampoo)
+
+# Run the logistic regression
+pt_ingredient_logistic <- glm(chose_women_shampoo ~ condition, 
+             data = pt_ingredient, 
+             family = binomial)
+
+# View results
+summary(pt_ingredient_logistic)
+exp(coef(pt_ingredient_logistic))
+exp(confint(pt_ingredient_logistic))
+```
+
+The analysis revealed a significant positive effect of the ingredient condition compared to the pink tax condition (β = 1.04, SE = 0.25, z = 4.19, p < .001). In the pink tax condition (reference group), 45.2% of participants chose women's shampoo. However, participants in the ingredient condition showed a substantially higher preference for women's shampoo at 67.4%, representing a significant increase in choice likelihood (OR = 2.83, 95% CI [1.75, 4.66]). This shows that ingredient may be a more justified reason for marketers to communicate when there are price premiums for women's products. 
+
+
+```{r}
+#| label: Pink tax vs. pink tax (ingredient justification) on product choice plot
+#| echo: false
+
+
+# Create choice labels
+choice_data <- pt_ingredient %>%
+  mutate(
+    choice_label = case_when(
+      product_choice == 1 ~ "Women's Shampoo",
+      product_choice == 2 ~ "Men's Shampoo", 
+      product_choice == 3 ~ "None"
+    ),
+    condition_label = case_when(
+      condition == "3C" ~ "Pink Tax (ingredient justification)",
+      condition == "2" ~ "Pink Tax"
+    )
+  ) %>%
+  count(condition_label, choice_label) %>%
+  group_by(condition_label) %>%
+  mutate(
+    total = sum(n),
+    proportion = n / total
+  )
+
+ggplot(choice_data, aes(x = condition_label, y = proportion, fill = choice_label)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = paste0(round(proportion*100, 1), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("Women's Shampoo" = "#e91e63", 
+                              "Men's Shampoo" = "#2196f3", 
+                              "None" = "#9e9e9e")) +
+  labs(
+    title = "Product Choice Distribution by Condition",
+    x = "Condition",
+    y = "Proportion",
+    fill = "Product Choice"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+
+
+
+
+```
+
+### Pink Tax vs. pink tax (fragrance justifications)
+```{r}
+#| label: Pink tax vs. pink tax (fragrance justifications)
+#| include: false
+pt_fragrance <- cleaned.pink %>%
+  filter(condition %in% c("2", "3D")) %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Make sure condition is factor with condition 2 as reference
+    condition = factor(condition, levels = c("2", "3D"))
+  )
+
+# Check the coding
+table(pt_fragrance$condition, pt_fragrance$chose_women_shampoo)
+
+# Run the logistic regression
+pt_fragrance_logistic <- glm(chose_women_shampoo ~ condition, 
+             data = pt_fragrance, 
+             family = binomial)
+
+# View results
+summary(pt_fragrance_logistic)
+exp(coef(pt_fragrance_logistic))
+exp(confint(pt_fragrance_logistic))
+```
+
+Insignificant. But the direction changes compared with the design and color justifications.
+
+```{r}
+#| label: Pink tax vs. pink tax (fragrance justification) on product choice plot
+#| echo: false
+
+
+# Create choice labels
+choice_data <- pt_fragrance %>%
+  mutate(
+    choice_label = case_when(
+      product_choice == 1 ~ "Women's Shampoo",
+      product_choice == 2 ~ "Men's Shampoo", 
+      product_choice == 3 ~ "None"
+    ),
+    condition_label = case_when(
+      condition == "3D" ~ "Pink Tax (fragrance justification)",
+      condition == "2" ~ "Pink Tax"
+    )
+  ) %>%
+  count(condition_label, choice_label) %>%
+  group_by(condition_label) %>%
+  mutate(
+    total = sum(n),
+    proportion = n / total
+  )
+
+ggplot(choice_data, aes(x = condition_label, y = proportion, fill = choice_label)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = paste0(round(proportion*100, 1), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("Women's Shampoo" = "#e91e63", 
+                              "Men's Shampoo" = "#2196f3", 
+                              "None" = "#9e9e9e")) +
+  labs(
+    title = "Product Choice Distribution by Condition",
+    x = "Condition",
+    y = "Proportion",
+    fill = "Product Choice"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+
+
+
+
+```
+
+
+### Pink Tax vs. pink tax (mkt justifications)
+```{r}
+#| label: Pink tax vs. pink tax (mkt justifications)
+#| include: false
+pt_mkt <- cleaned.pink %>%
+  filter(condition %in% c("2", "3E")) %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Make sure condition is factor with condition 2 as reference
+    condition = factor(condition, levels = c("2", "3E"))
+  )
+
+# Check the coding
+table(pt_mkt$condition, pt_mkt$chose_women_shampoo)
+
+# Run the logistic regression
+pt_mkt_logistic <- glm(chose_women_shampoo ~ condition, 
+             data = pt_mkt, 
+             family = binomial)
+
+# View results
+summary(pt_mkt_logistic)
+exp(coef(pt_mkt_logistic))
+exp(confint(pt_mkt_logistic))
+```
+
+The analysis revealed a highly significant positive effect of the marketing condition compared to the pink tax condition (β = 1.27, SE = 0.26, z = 4.85, p < .001). In the pink tax condition (reference group), 45.2% of participants chose women's shampoo. However, participants in the marketing condition showed a substantially higher preference for women's shampoo at 74.4%, representing a dramatic increase in choice likelihood (OR = 3.55, 95% CI [2.15, 6.01]).
+
+```{r}
+#| label: Pink tax vs. pink tax (mkt justification) on product choice plot
+#| echo: false
+
+
+# Create choice labels
+choice_data <- pt_mkt %>%
+  mutate(
+    choice_label = case_when(
+      product_choice == 1 ~ "Women's Shampoo",
+      product_choice == 2 ~ "Men's Shampoo", 
+      product_choice == 3 ~ "None"
+    ),
+    condition_label = case_when(
+      condition == "3E" ~ "Pink Tax (mkt justification)",
+      condition == "2" ~ "Pink Tax"
+    )
+  ) %>%
+  count(condition_label, choice_label) %>%
+  group_by(condition_label) %>%
+  mutate(
+    total = sum(n),
+    proportion = n / total
+  )
+
+ggplot(choice_data, aes(x = condition_label, y = proportion, fill = choice_label)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = paste0(round(proportion*100, 1), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("Women's Shampoo" = "#e91e63", 
+                              "Men's Shampoo" = "#2196f3", 
+                              "None" = "#9e9e9e")) +
+  labs(
+    title = "Product Choice Distribution by Condition",
+    x = "Condition",
+    y = "Proportion",
+    fill = "Product Choice"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+
+
+
+
+```
+
+***Control vs. pink tax***
+
+Significantly less likely to choose women's shampoo under the pink tax (45.2%) compared with under control (79.8%)
+
+***Pink tax vs. pink tax with justifications***
+
+- Insignificant but less likely to choose women's shampoo when there were justifications based on design & color
+- Insignificant but more likely to choose women's shampoo when justified by fragrance
+- Significantly more likely to choose women's shampoo when there is ingredient justification (70%) and marketing justification (74.5%), the latter is almost the same as those in the control condition --> suggesting that ingredient difference and branding are more reasonable justifications of price premiums. One is more like a rational appeal, the other is more like an emotional appeal. 
+
+
+## Linear Regression - Conditions' Impacts on Buying Intentions for Women's shampoo
+
+* I used buying intention for women's shampoo minus buying intention for men's shampoo to construct the variable - Buying intention for women's shampoo (so positive when prone to women's shampoo, 0 when no difference, and negative when prone to men's shampoo)
+
+
+### Control vs. pink tax
+Results showed a significant effect of pink tax information on buying intention differences, F(2, 422) = 29.05, p < .001, R² = .121. Control participants favored women's shampoo (M = 2.41), while pink tax participants showed 1.83 points lower preference (β = -1.83, p < .001). Income had a marginally significant positive effect (β = 5.89e-06, p = .070). Pink tax awareness substantially reduces preference for women's products even controlling for economic factors.
+```{r}
+#| label: Control vs. pink tax on buying intention
+#| echo: false
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_control_pt <- lm(bi_women ~ condition + income, data = control_pt)
+
+# View results
+summary(linear_control_pt)
+
+
+
+
+
+```
+
+### Pink tax vs. pink tax (design justifications)
+
+Insignificantly lower buying intentions for women's shampoo, consistent with the logistic regression result. 
+```{r}
+#| label: Pink tax vs. pink tax (design justification)
+#| echo: false
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_design <- lm(bi_women ~ condition + income, data = pt_design)
+
+# View results
+summary(linear_pt_design)
+
+
+
+
+
+```
+
+### Pink tax vs. pink tax (color justifications)
+
+Significantly lower buying intentions for women's shampoo, inconsistent with the logistic regression result, suggesting that color may be a less effective justification that may even backfire on buying intentions for women's shampoo than the logistic regression shows. 
+```{r}
+#| label: Pink tax vs. pink tax (color justification)
+#| echo: false
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_color <- lm(bi_women ~ condition + income, data = pt_color)
+
+# View results
+summary(linear_pt_color)
+
+
+
+```
+
+### Pink tax vs. pink tax (ingredient justifications)
+
+Significantly higher buying intentions for women's shampoo, consistent with the logistic regression result. 
+```{r}
+#| label: Pink tax vs. pink tax (ingredient justification)
+#| echo: false
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_ingredient <- lm(bi_women ~ condition + income, data = pt_ingredient)
+
+# View results
+summary(linear_pt_ingredient)
+
+
+
+```
+
+### Pink tax vs. pink tax (fragrance justifications)
+
+Insignificantly higher, consistent with the logistic regression. 
+```{r}
+#| label: Pink tax vs. pink tax (fragrance justification)
+#| echo: false
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_fragrance <- lm(bi_women ~ condition + income, data = pt_fragrance)
+
+# View results
+summary(linear_pt_fragrance)
+
+
+
+```
+
+### Pink tax vs. pink tax (mkt justifications)
+
+Significantly higher buying intentions, consistent with the logistic regression. 
+```{r}
+#| label: Pink tax vs. pink tax (mkt justification)
+#| echo: false
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_mkt <- lm(bi_women ~ condition + income, data = pt_mkt)
+
+# View results
+summary(linear_pt_mkt)
+
+
+
+```
+
+**Results are consistent with logistic regressions, except that the buying intentions for women's shampoo is significantly lower when there is color justification compared with when there is no.**
+
+# Exploratory Analyses
+
+## Control vs. Pink Tax with Justifications
+
+### Logistic Regression - Product choice
+Compared with those under the control condition, participants showed significantly less product choice of women's shampoo under the pink tax with design justification, color justification, and the fragrance justification.
+
+Nevertheless, there was no statistically significant difference between control and particiapants under the pink tax with ingredient justification (p = 0.0513), and participants under the pink tax with marketing justification (p = 0.29). The latter one is very impressive.
+```{r}
+#| label: Control vs. Pink Tax with Justifications
+#| echo: false
+
+# Control vs. Pink Tax with design justification
+ct_design <- cleaned.pink %>%
+  filter(condition %in% c("1", "3A")) %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Make sure condition is factor with condition 2 as reference
+    condition = factor(condition, levels = c("1", "3A"))
+  )
+
+
+# Run the logistic regression
+ct_design_logistic <- glm(chose_women_shampoo ~ condition, 
+             data = ct_design, 
+             family = binomial)
+
+# View results
+summary(ct_design_logistic)
+exp(coef(ct_design_logistic))
+exp(confint(ct_design_logistic))
+
+# Control vs. Pink Tax with color justification
+ct_color <- cleaned.pink %>%
+  filter(condition %in% c("1", "3B")) %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Make sure condition is factor with condition 2 as reference
+    condition = factor(condition, levels = c("1", "3B"))
+  )
+
+
+# Run the logistic regression
+ct_color_logistic <- glm(chose_women_shampoo ~ condition, 
+             data = ct_color, 
+             family = binomial)
+
+# View results
+summary(ct_color_logistic)
+exp(coef(ct_color_logistic))
+exp(confint(ct_color_logistic))
+
+# Control vs. Pink Tax with ingredient justification
+ct_ingredient <- cleaned.pink %>%
+  filter(condition %in% c("1", "3C")) %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Make sure condition is factor with condition 2 as reference
+    condition = factor(condition, levels = c("1", "3C"))
+  )
+
+
+# Run the logistic regression
+ct_ingredient_logistic <- glm(chose_women_shampoo ~ condition, 
+             data = ct_ingredient, 
+             family = binomial)
+
+# View results
+summary(ct_ingredient_logistic)
+exp(coef(ct_ingredient_logistic))
+exp(confint(ct_ingredient_logistic))
+
+# Control vs. Pink Tax with fragrance justification
+ct_fragrance <- cleaned.pink %>%
+  filter(condition %in% c("1", "3D")) %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Make sure condition is factor with condition 2 as reference
+    condition = factor(condition, levels = c("1", "3D"))
+  )
+
+
+# Run the logistic regression
+ct_fragrance_logistic <- glm(chose_women_shampoo ~ condition, 
+             data = ct_fragrance, 
+             family = binomial)
+
+# View results
+summary(ct_fragrance_logistic)
+exp(coef(ct_fragrance_logistic))
+exp(confint(ct_fragrance_logistic))
+
+# Control vs. Pink Tax with marketing justification
+ct_mkt <- cleaned.pink %>%
+  filter(condition %in% c("1", "3E")) %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Make sure condition is factor with condition 2 as reference
+    condition = factor(condition, levels = c("1", "3E"))
+  )
+
+
+# Run the logistic regression
+ct_mkt_logistic <- glm(chose_women_shampoo ~ condition, 
+             data = ct_mkt, 
+             family = binomial)
+
+# View results
+summary(ct_mkt_logistic)
+exp(coef(ct_mkt_logistic))
+exp(confint(ct_mkt_logistic))
+
+
+
+```
+### Linear Regression - Buying intentions for women's shampoo
+
+
+Same pattern. All conditions have significantly lower buying intentions for women's shampoo under the pink tax with justifications except for the marketing justification.
+
+```{r}
+#| label: Control vs. Pink Tax with Justifications - Linear
+#| echo: false
+
+# Control vs. Pink Tax with design justification
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_ct_design <- lm(bi_women ~ condition + income, data = ct_design)
+
+# View results
+summary(linear_ct_design)
+
+# Control vs. Pink Tax with color justification
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_ct_color <- lm(bi_women ~ condition + income, data = ct_color)
+
+# View results
+summary(linear_ct_color)
+
+# Control vs. Pink Tax with ingredient justification
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_ct_ingredient <- lm(bi_women ~ condition + income, data = ct_ingredient)
+
+# View results
+summary(linear_ct_ingredient)
+
+
+# Control vs. Pink Tax with fragrance justification
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_ct_fragrance <- lm(bi_women ~ condition + income, data = ct_fragrance)
+
+# View results
+summary(linear_ct_fragrance)
+
+# Control vs. Pink Tax with marketing justification
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_ct_mkt <- lm(bi_women ~ condition + income, data = ct_mkt)
+
+# View results
+summary(linear_ct_mkt)
+
+
+```
+
+## Pink Tax vs. Pink Tax with Justifications on Similarity, Estimated Costs, and Price Fairness
+
+### Perceived Similarity
+
+There is no significant difference of perceived similarity of women and men's shampoo under the design and color justifications compared with the pink tax condition.
+
+The perceived similarity is significantly lower under the ingredient justification condition (p<.001), the fragrance justification condition (p<.001), and the marketing justification condition (p<.001) compared with the pink tax condition (p =0.04).
+
+The perceived similarity may explain the product choice, as when the participants perceive the products are less similar (like under the ingredient justification), they showed higher buying intentions for women's shampoo. But even if they perceive two products less similar under the fragrance justification, this cannot explain why they don't show higher buying intention under this condition. Intestingly, the perceived similarity of two products approach the calibration, suggesting that similarity is a relatively weak explanatory factor for participants' high buying intentions for women's shampoo under the marketing justification. 
+
+
+
+```{r}
+#| label: Pink Tax vs. Pink Tax with Justifications - Similarity
+#| echo: false
+
+# Pink Tax vs. Pink Tax with design justification
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_design_sim <- lm(similarity ~ condition + income, data = pt_design)
+
+# View results
+summary(linear_pt_design_sim)
+
+
+# Pink Tax vs. Pink Tax with color justification
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_color_sim <- lm(similarity ~ condition + income, data = pt_color)
+
+# View results
+summary(linear_pt_color_sim)
+
+
+# Pink Tax vs. Pink Tax with ingredient justification
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_ingredient_sim <- lm(similarity ~ condition + income, data = pt_ingredient)
+
+# View results
+summary(linear_pt_ingredient_sim)
+
+# Pink Tax vs. Pink Tax with fragrance justification
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_fragrance_sim <- lm(similarity ~ condition + income, data = pt_fragrance)
+
+# View results
+summary(linear_pt_fragrance_sim)
+
+# Pink Tax vs. Pink Tax with marketing justification
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_mkt_sim <- lm(similarity ~ condition + income, data = pt_mkt)
+
+# View results
+summary(linear_pt_mkt_sim)
+
+```
+
+
+
+### Estimated costs
+
+The estimated costs difference (women-men) are significantly higher in the ingredient justification condition (p = 0.025), but no significant difference was found for other conditions. This suggests that apart from similarity, consumers may perceive products with different ingredients having higher manufacturing costs. Also the cost difference cannot explain the marketing condition's impact. 
+
+
+```{r}
+#| label: Pink Tax vs. Pink Tax with Justifications - Costs
+#| echo: false
+
+
+# Pink Tax vs. Pink Tax with design justification
+
+pt_design <- pt_design %>%
+  mutate(cost_diff = cost_women - cost_men)
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_design_cost <- lm(cost_diff ~ condition + income, data = pt_design)
+
+# View results
+summary(linear_pt_design_cost)
+
+
+# Pink Tax vs. Pink Tax with color justification
+
+pt_color <- pt_color %>%
+  mutate(cost_diff = cost_women - cost_men)
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_color_cost <- lm(cost_diff ~ condition + income, data = pt_color)
+
+# View results
+summary(linear_pt_color_cost)
+
+
+# Pink Tax vs. Pink Tax with ingredient justification
+
+pt_ingredient <- pt_ingredient %>%
+  mutate(cost_diff = cost_women - cost_men)
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_ingredient_cost <- lm(cost_diff ~ condition + income, data = pt_ingredient)
+
+# View results
+summary(linear_pt_ingredient_cost)
+
+# Pink Tax vs. Pink Tax with fragrance justification
+
+pt_fragrance <- pt_fragrance %>%
+  mutate(cost_diff = cost_women - cost_men)
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_fragrance_cost <- lm(cost_diff ~ condition + income, data = pt_fragrance)
+
+# View results
+summary(linear_pt_fragrance_cost)
+
+# Pink Tax vs. Pink Tax with marketing justification
+
+pt_mkt <- pt_mkt %>%
+  mutate(cost_diff = cost_women - cost_men)
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_mkt_cost <- lm(cost_diff ~ condition + income, data = pt_mkt)
+
+# View results
+summary(linear_pt_mkt_cost)
+
+
+
+
+
+
+```
+
+### Price Fairness
+
+No difference for design justification and fragrance justification.
+
+Significantly more unfair for color justification (p = 0.012), consistent with the lower buying intentions. 
+
+Significantly more fair for ingredient justification (p <0.001) and the marketing justification (p <0.001), consistent with the higher buying intentions.
+
+
+
+```{r}
+#| label: Pink Tax vs. Pink Tax with Justifications - Price fairness
+#| echo: false
+
+# Pink Tax vs. Pink Tax with design justification
+
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_design_pf <- lm(price_fairness ~ condition + income, data = pt_design)
+
+# View results
+summary(linear_pt_design_pf)
+
+
+# Pink Tax vs. Pink Tax with color justification
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_color_pf <- lm(price_fairness ~ condition + income, data = pt_color)
+
+# View results
+summary(linear_pt_color_pf) #Significantly unfair
+
+
+# Pink Tax vs. Pink Tax with ingredient justification
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_ingredient_pf <- lm(price_fairness ~ condition + income, data = pt_ingredient)
+
+# View results
+summary(linear_pt_ingredient_pf)
+
+# Pink Tax vs. Pink Tax with fragrance justification
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_fragrance_pf <- lm(price_fairness ~ condition + income, data = pt_fragrance)
+
+# View results
+summary(linear_pt_fragrance_pf)
+
+# Pink Tax vs. Pink Tax with mkt justification
+options(scipen = 999)
+
+# Linear regression with income as control variable
+linear_pt_mkt_pf <- lm(price_fairness ~ condition + income, data = pt_mkt)
+
+# View results
+summary(linear_pt_mkt_pf)
+
+```
+
+
+## Mediation Models
+
+### Perceived similarity as a mediator
+
+#### Product choice
+
+The perceived similarity has no use on the product choice under the design justification,  color justification, and fragrance justification conditions, but it fully mediates the ingredient justification on the product choice (i.e., under the ingredient justification, consumers tend to perceive products as more different, contributing to higher buying intentions for women's shampoo). There is a weak mediation of similarity on marketing message condition's impact on product choice (the direct effect is much stronger). 
+
+Mediation analysis revealed complete mediation, with a highly significant indirect effect (ACME = 0.174, p < .001) and no significant direct effect (ADE = 0.067, p = .225). The mediator explained 72.1% of the total treatment effect (p < .001), indicating that the treatment condition influences the outcome primarily through its effect on the mediator rather than through direct pathways.
+
+
+```{r}
+#| label: Similarity Mediation - Product choice
+#| echo: false
+#| include: false
+
+options(repos = c(CRAN = "https://cran.rstudio.com/"))
+
+# Install packages if needed
+if(!require(mediation)) install.packages("mediation")
+library(mediation)
+
+# Pink Tax vs. Pink Tax with design justification: No effect
+
+pt_design <- pt_design %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Create binary IV: 0 = pink tax (condition 2), 1 = design justification (condition 3A)
+    design_condition = ifelse(condition == "3A", 1, 0)
+  )
+
+# Check the coding
+table(pt_design$condition, pt_design$design_condition)
+table(pt_design$condition, pt_design$chose_women_shampoo)
+
+
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(similarity ~ design_condition, data = pt_design)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ design_condition + similarity, 
+                 data = pt_design, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "design_condition", 
+                       mediator = "similarity",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with color justification: No effect
+
+pt_color <- pt_color %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Create binary IV: 0 = pink tax (condition 2), 1 = design justification (condition 3A)
+    color_condition = ifelse(condition == "3B", 1, 0)
+  )
+
+# Check the coding
+table(pt_color$condition, pt_color$color_condition)
+table(pt_color$condition, pt_color$chose_women_shampoo)
+
+
+
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(similarity ~ color_condition, data = pt_color)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ color_condition + similarity, 
+                 data = pt_color, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "color_condition", 
+                       mediator = "similarity",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with ingredient justification: Significant effect
+
+pt_ingredient <- pt_ingredient %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Create binary IV: 0 = pink tax (condition 2), 1 = design justification (condition 3A)
+    ingredient_condition = ifelse(condition == "3C", 1, 0)
+  )
+
+# Check the coding
+table(pt_ingredient$condition, pt_ingredient$ingredient_condition)
+table(pt_ingredient$condition, pt_ingredient$chose_women_shampoo)
+
+
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(similarity ~ ingredient_condition, data = pt_ingredient)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ ingredient_condition + similarity, 
+                 data = pt_ingredient, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "ingredient_condition", 
+                       mediator = "similarity",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+
+
+
+# Pink Tax vs. Pink Tax with fragrance justification: No effect
+
+pt_fragrance <- pt_fragrance %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Create binary IV: 0 = pink tax (condition 2), 1 = design justification (condition 3A)
+    fragrance_condition = ifelse(condition == "3D", 1, 0)
+  )
+
+# Check the coding
+table(pt_fragrance$condition, pt_fragrance$fragrance_condition)
+table(pt_fragrance$condition, pt_fragrance$chose_women_shampoo)
+
+
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(similarity ~ fragrance_condition, data = pt_fragrance)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ fragrance_condition + similarity, 
+                 data = pt_fragrance, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "fragrance_condition", 
+                       mediator = "similarity",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with marketing justification: Weak effect
+
+pt_mkt <- pt_mkt %>%
+  mutate(
+    # Create binary DV: 1 = women's shampoo, 0 = all else
+    chose_women_shampoo = ifelse(product_choice == 1, 1, 0),
+    # Create binary IV: 0 = pink tax (condition 2), 1 = design justification (condition 3A)
+    mkt_condition = ifelse(condition == "3E", 1, 0)
+  )
+
+# Check the coding
+table(pt_mkt$condition, pt_mkt$mkt_condition)
+table(pt_mkt$condition, pt_mkt$chose_women_shampoo)
+
+
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(similarity ~ mkt_condition, data = pt_mkt)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ mkt_condition + similarity, 
+                 data = pt_mkt, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "mkt_condition", 
+                       mediator = "similarity",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+```
+
+
+#### Purchase intention
+
+Same pattern. No total effect or mediation for design and color justifications. Significant direct effect for fragrance but insignificant mediation. Full mediation for ingredient, weak mediation and strong direct effects for marketing message. 
+
+```{r}
+#| label: Similarity Mediation - Purchase intention
+#| echo: false
+#| include: false
+
+# Pink Tax vs. Pink Tax with design justification: No effect
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(similarity ~ design_condition, data = pt_design)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ design_condition + similarity, data = pt_design)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "design_condition", 
+                       mediator = "similarity",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with color justification: No effect
+
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(similarity ~ color_condition, data = pt_color)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ color_condition + similarity, data = pt_color)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "color_condition", 
+                       mediator = "similarity",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with ingredient justification: Significant effect
+
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(similarity ~ ingredient_condition, data = pt_ingredient)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ ingredient_condition + similarity, data = pt_ingredient)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "ingredient_condition", 
+                       mediator = "similarity",
+                       boot = TRUE, sims = 5000)
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with fragrance justification: No effect
+
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(similarity ~ fragrance_condition, data = pt_fragrance)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ fragrance_condition + similarity, data = pt_fragrance)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "fragrance_condition", 
+                       mediator = "similarity",
+                       boot = TRUE, sims = 5000)
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with marketing justification: Weak effect
+
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(similarity ~ mkt_condition, data = pt_mkt)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ mkt_condition + similarity, data = pt_mkt)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "mkt_condition", 
+                       mediator = "similarity",
+                       boot = TRUE, sims = 5000)
+# View results
+summary(med_results)
+
+```
+
+### Estimated cost as a mediator
+
+#### Product choice
+
+Insignificant for design, color, fragrance, and marketing justifications. 
+
+Partial mediation for the pink tax with the ingredient justification - Mediation analysis revealed partial mediation, with both significant indirect (ACME = 0.033, p = .033) and direct effects (ADE = 0.205, p < .001). The mediator explained only 14.0% of the total treatment effect, indicating that while the proposed mediational pathway is statistically significant, the majority of the treatment's influence (86%) operates through alternative mechanisms not captured by this mediator. The strong direct effect suggests additional mediators or pathways should be explored to fully understand how the treatment influences the outcome. Consistent with the full mediation of similarity. 
+
+
+
+```{r}
+#| label: Estimated Cost Mediation - Product choice
+#| echo: false
+#| include: false
+
+
+# Pink Tax vs. Pink Tax with design justification: No effect
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(cost_diff ~ design_condition, data = pt_design)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ design_condition + cost_diff, 
+                 data = pt_design, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "design_condition", 
+                       mediator = "cost_diff",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with color justification: No effect
+
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(cost_diff ~ color_condition, data = pt_color)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ color_condition + cost_diff, 
+                 data = pt_color, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "color_condition", 
+                       mediator = "cost_diff",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with ingredient justification: Partial mediation effect
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(cost_diff ~ ingredient_condition, data = pt_ingredient)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ ingredient_condition + cost_diff, 
+                 data = pt_ingredient, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "ingredient_condition", 
+                       mediator = "cost_diff",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+
+# Pink Tax vs. Pink Tax with fragrance justification: No effect
+
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(cost_diff ~ fragrance_condition, data = pt_fragrance)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ fragrance_condition + cost_diff, 
+                 data = pt_fragrance, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "fragrance_condition", 
+                       mediator = "cost_diff",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with marketing justification: No effect
+
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(cost_diff ~ mkt_condition, data = pt_mkt)
+                 
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ mkt_condition + cost_diff, 
+                 data = pt_mkt, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "mkt_condition", 
+                       mediator = "cost_diff",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+```
+
+
+
+
+#### Purchase intention
+
+Same pattern. No further explanation. 
+
+
+```{r}
+#| label: Estimated Cost Mediation - Purchase intention
+#| echo: false
+#| include: false
+
+# Pink Tax vs. Pink Tax with design justification: No effect
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(cost_diff ~ design_condition, data = pt_design)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ design_condition + cost_diff, data = pt_design)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "design_condition", 
+                       mediator = "cost_diff",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with color justification: No effect
+
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(cost_diff ~ color_condition, data = pt_color)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ color_condition + cost_diff, data = pt_color)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "color_condition", 
+                       mediator = "cost_diff",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with ingredient justification: Significant effect
+
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(cost_diff ~ ingredient_condition, data = pt_ingredient)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ ingredient_condition + cost_diff, data = pt_ingredient)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "ingredient_condition", 
+                       mediator = "cost_diff",
+                       boot = TRUE, sims = 5000)
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with fragrance justification: No effect
+
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(cost_diff ~ fragrance_condition, data = pt_fragrance)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ fragrance_condition + cost_diff, data = pt_fragrance)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "fragrance_condition", 
+                       mediator = "cost_diff",
+                       boot = TRUE, sims = 5000)
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with marketing justification: Weak effect
+
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(cost_diff ~ mkt_condition, data = pt_mkt)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ mkt_condition + cost_diff, data = pt_mkt)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "mkt_condition", 
+                       mediator = "cost_diff",
+                       boot = TRUE, sims = 5000)
+# View results
+summary(med_results)
+
+```
+
+### Perceived price fairness as a mediator
+
+#### Product choice
+
+No effect for design and fragrance.
+
+Negative full mediation of color justification (i.e., color justification leads to lower perceived fairness, contributing to lower product choice). 
+
+For ingredient, Mediation analysis revealed substantial partial mediation, with both significant indirect (ACME = 0.077, p = .001) and direct effects (ADE = 0.172, p < .001). The mediator explained 30.8% of the total treatment effect, indicating that the proposed mediational pathway accounts for nearly one-third of how the treatment influences the outcome. While the direct effect remains larger (69%), the mediator plays a substantial and significant role in the treatment mechanism.
+
+For marketing message, Mediation analysis revealed strong partial mediation, with highly significant indirect (ACME = 0.076, p < .001) and direct effects (ADE = 0.221, p < .001). The mediator explained 25.7% of the total treatment effect (p < .001), indicating that the proposed mediational pathway accounts for more than one-quarter of how the treatment influences the outcome. While the direct effect remains larger (74%), the mediator plays a substantial and significant role in the treatment mechanism.
+
+
+```{r}
+#| label: Price Fairness Mediation - Product choice
+#| echo: false
+#| include: false
+
+
+# Pink Tax vs. Pink Tax with design justification: No effect
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(price_fairness ~ design_condition, data = pt_design)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ design_condition + price_fairness, 
+                 data = pt_design, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "design_condition", 
+                       mediator = "price_fairness",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with color justification: No effect
+
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(price_fairness ~ color_condition, data = pt_color)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ color_condition + price_fairness, 
+                 data = pt_color, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "color_condition", 
+                       mediator = "price_fairness",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with ingredient justification: Strong mediation effect
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(price_fairness ~ ingredient_condition, data = pt_ingredient)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ ingredient_condition + price_fairness, 
+                 data = pt_ingredient, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "ingredient_condition", 
+                       mediator = "price_fairness",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+
+# Pink Tax vs. Pink Tax with fragrance justification: No effect
+
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(price_fairness ~ fragrance_condition, data = pt_fragrance)
+
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ fragrance_condition + price_fairness, 
+                 data = pt_fragrance, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "fragrance_condition", 
+                       mediator = "price_fairness",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with marketing justification: No effect
+
+
+# Step 1: Mediator model (IV -> Mediator)
+med_model <- lm(price_fairness ~ mkt_condition, data = pt_mkt)
+                 
+# Step 2: Outcome model (IV + Mediator -> DV)
+out_model <- glm(chose_women_shampoo ~ mkt_condition + price_fairness, 
+                 data = pt_mkt, family = binomial)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "mkt_condition", 
+                       mediator = "price_fairness",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+```
+
+
+#### Purchase intention
+
+Same pattern. No further explanation. 
+
+
+```{r}
+#| label: Perceived price fairness Mediation - Purchase intention
+#| echo: false
+#| include: false
+
+# Pink Tax vs. Pink Tax with design justification: No effect
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(price_fairness ~ design_condition, data = pt_design)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ design_condition + price_fairness, data = pt_design)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "design_condition", 
+                       mediator = "price_fairness",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with color justification: No effect
+
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(price_fairness ~ color_condition, data = pt_color)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ color_condition + price_fairness, data = pt_color)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "color_condition", 
+                       mediator = "price_fairness",
+                       boot = TRUE, sims = 5000)
+
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with ingredient justification: Significant effect
+
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(price_fairness ~ ingredient_condition, data = pt_ingredient)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ ingredient_condition + price_fairness, data = pt_ingredient)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "ingredient_condition", 
+                       mediator = "price_fairness",
+                       boot = TRUE, sims = 5000)
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with fragrance justification: No effect
+
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(price_fairness ~ fragrance_condition, data = pt_fragrance)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ fragrance_condition + price_fairness, data = pt_fragrance)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "fragrance_condition", 
+                       mediator = "price_fairness",
+                       boot = TRUE, sims = 5000)
+# View results
+summary(med_results)
+
+# Pink Tax vs. Pink Tax with marketing justification: Weak effect
+
+# Step 1: Mediator model (IV -> Mediator) - Linear regression
+med_model <- lm(price_fairness ~ mkt_condition, data = pt_mkt)
+
+# Step 2: Outcome model (IV + Mediator -> DV) - Linear regression
+out_model <- lm(bi_women ~ mkt_condition + price_fairness, data = pt_mkt)
+
+# Step 3: Mediation analysis
+med_results <- mediate(med_model, out_model, 
+                       treat = "mkt_condition",
+                       mediator = "price_fairness",
+                       boot = TRUE, sims = 5000)
+# View results
+summary(med_results)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
